@@ -27,7 +27,7 @@ from io_utils import estimate_area_km2, geometry_for_selection, geometry_geojson
 from water_indices import INDEX_DEFINITIONS, keys_for_group
 
 
-st.set_page_config(page_title="Lake Spectral Explorer", layout="wide")
+st.set_page_config(page_title="LakeScope", layout="wide")
 
 GEE_PROJECT = "gg-wa-temp-2025"
 MIN_S2_DATE = date(2017, 3, 28)
@@ -39,29 +39,120 @@ def parse_upload(filename: str, payload: bytes):
     return load_vector_bytes(filename, payload)
 
 
-def add_ee_layer(m, image, params, name):
-    map_id = ee.Image(image).getMapId(params)
-    folium.raster_layers.TileLayer(
-        tiles=map_id["tile_fetcher"].url_format,
-        attr="Google Earth Engine",
-        name=name,
-        overlay=True,
-        control=True,
+def download_ee_geotiff(image, ee_geom, scale: int) -> bytes:
+    """Download one EE image to an in-memory GeoTIFF for mapping/download.
+
+    This intentionally avoids ``Image.getMapId()``. Hosted Streamlit service
+    accounts can reach the EE computation API while map-tile creation can fail
+    separately. A real GeoTIFF is also preferable because the map and the user
+    download are derived from the same spatial product.
+    """
+    import geemap
+
+    tmp = tempfile.NamedTemporaryFile(suffix=".tif", delete=False)
+    tmp_path = Path(tmp.name)
+    tmp.close()
+    try:
+        geemap.download_ee_image(
+            image=ee.Image(image).toFloat(),
+            filename=str(tmp_path),
+            region=ee_geom,
+            scale=scale,
+        )
+        if not tmp_path.exists() or tmp_path.stat().st_size == 0:
+            raise RuntimeError("Earth Engine returned an empty GeoTIFF.")
+        return tmp_path.read_bytes()
+    finally:
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
+def geotiff_to_rgba(tif_bytes: bytes, params):
+    """Reproject a single-band GeoTIFF to WGS84 and colour it for Folium.
+
+    Reprojecting the raster pixels themselves (rather than merely transforming
+    the bounding box) prevents raster/vector shifts in the browser map.
+    """
+    import numpy as np
+    from matplotlib.colors import LinearSegmentedColormap
+    from rasterio.io import MemoryFile
+    from rasterio.transform import array_bounds
+    from rasterio.warp import calculate_default_transform, reproject, Resampling
+
+    with MemoryFile(tif_bytes) as memfile:
+        with memfile.open() as src:
+            if src.count < 1:
+                raise RuntimeError("Downloaded GeoTIFF has no raster band.")
+            if src.crs is None:
+                raise RuntimeError("Downloaded GeoTIFF has no CRS.")
+
+            source = src.read(1, masked=True).astype("float32").filled(np.nan)
+            dst_crs = "EPSG:4326"
+
+            if str(src.crs).upper() == dst_crs:
+                data = source
+                transform = src.transform
+                height, width = src.height, src.width
+            else:
+                transform, width, height = calculate_default_transform(
+                    src.crs, dst_crs, src.width, src.height, *src.bounds
+                )
+                data = np.full((height, width), np.nan, dtype="float32")
+                reproject(
+                    source=source,
+                    destination=data,
+                    src_transform=src.transform,
+                    src_crs=src.crs,
+                    dst_transform=transform,
+                    dst_crs=dst_crs,
+                    src_nodata=np.nan,
+                    dst_nodata=np.nan,
+                    resampling=Resampling.nearest,
+                )
+
+    valid = np.isfinite(data)
+    vmin = float(params["min"])
+    vmax = float(params["max"])
+    norm = np.zeros_like(data, dtype="float32")
+    norm[valid] = np.clip((data[valid] - vmin) / (vmax - vmin), 0, 1)
+
+    colors = ["#" + str(c).lstrip("#") for c in params["palette"]]
+    cmap = LinearSegmentedColormap.from_list("lakescope_index", colors)
+    rgba = np.round(cmap(norm) * 255).astype("uint8")
+    rgba[..., 3] = np.where(valid, 235, 0).astype("uint8")
+
+    west, south, east, north = array_bounds(height, width, transform)
+    leaflet_bounds = [[south, west], [north, east]]
+    return rgba, leaflet_bounds
+
+
+def map_for_geotiff(tif_bytes, geom_geojson, bounds, params, title):
+    minx, miny, maxx, maxy = bounds
+    rgba, raster_bounds = geotiff_to_rgba(tif_bytes, params)
+
+    m = folium.Map(tiles=None, control_scale=True, prefer_canvas=True)
+    m.get_root().header.add_child(
+        folium.Element("<style>.leaflet-container{background:white !important;}</style>")
+    )
+    folium.raster_layers.ImageOverlay(
+        image=rgba,
+        bounds=raster_bounds,
+        name=title,
+        opacity=1.0,
+        interactive=False,
+        cross_origin=False,
+        zindex=2,
         show=True,
     ).add_to(m)
-
-
-def map_for_image(image, geom_geojson, bounds, params, title):
-    minx, miny, maxx, maxy = bounds
-    m = folium.Map(tiles=None, control_scale=True)
-    add_ee_layer(m, image, params, title)
     folium.GeoJson(
         geom_geojson,
         name="Uploaded boundary",
         style_function=lambda _: {"color": "black", "weight": 2.5, "fillOpacity": 0},
     ).add_to(m)
     cmap = LinearColormap(
-        colors=[f"#{c}" for c in params["palette"]],
+        colors=["#" + str(c).lstrip("#") for c in params["palette"]],
         vmin=params["min"], vmax=params["max"], caption=title,
     )
     cmap.add_to(m)
@@ -75,7 +166,7 @@ def current_analysis_key(file_bytes, selection, index_key, start_date, end_date,
     return "|".join(map(str, [h, selection, index_key, start_date, end_date, scene_cloud, cloud_prob, water_occ, temporal_mode]))
 
 
-st.title("Lake Spectral Explorer")
+st.title("LakeScope")
 st.caption(
     "Upload lake polygons, calculate Sentinel-2 water-quality spectral indices in Google Earth Engine, "
     "inspect spatial patterns, and examine temporal change."
@@ -275,35 +366,50 @@ if vmin >= vmax:
 
 params = vis_params(index_key, vmin, vmax)
 bounds = geom.bounds
-map_obj = map_for_image(spatial_image, geometry_geojson(geom), bounds, params, spatial_title)
-st_folium(map_obj, use_container_width=True, height=620, returned_objects=[])
 
-# Small, on-demand GeoTIFF download. geemap handles the Earth Engine transfer.
-if st.button("Prepare GeoTIFF download"):
-    import geemap
-    with st.spinner("Preparing GeoTIFF..."):
+spatial_cache_key = "|".join(
+    map(str, [
+        analysis_key, spatial_mode,
+        selected_date if spatial_mode == "Single acquisition" else "period",
+        index_key, spec["scale"],
+    ])
+)
+
+if st.session_state.get("spatial_tif_key") != spatial_cache_key:
+    with st.spinner("Preparing the spatial index map..."):
         try:
-            tmp = tempfile.NamedTemporaryFile(suffix=".tif", delete=False)
-            tmp.close()
-            geemap.download_ee_image(
-                image=spatial_image.toFloat(),
-                filename=tmp.name,
-                region=ee_geom,
-                scale=spec["scale"],
+            st.session_state["spatial_tif_bytes"] = download_ee_geotiff(
+                spatial_image, ee_geom, spec["scale"]
             )
-            tif_bytes = Path(tmp.name).read_bytes()
-            st.session_state["tif_bytes"] = tif_bytes
-            st.session_state["tif_name"] = f"{geom_label.replace(' ', '_')}_{index_key}_{spatial_mode.replace(' ', '_')}.tif"
+            st.session_state["spatial_tif_key"] = spatial_cache_key
+            st.session_state["spatial_tif_name"] = (
+                f"{geom_label.replace(' ', '_')}_{index_key}_"
+                f"{(selected_date if spatial_mode == 'Single acquisition' else spatial_mode).replace(' ', '_')}.tif"
+            )
         except Exception as exc:
-            st.error(f"GeoTIFF preparation failed: {exc}")
+            st.error(f"Spatial GeoTIFF preparation failed: {exc}")
+            st.stop()
 
-if st.session_state.get("tif_bytes"):
-    st.download_button(
-        "Download GeoTIFF",
-        data=st.session_state["tif_bytes"],
-        file_name=st.session_state.get("tif_name", "lake_index.tif"),
-        mime="image/tiff",
+tif_bytes = st.session_state.get("spatial_tif_bytes")
+if not tif_bytes:
+    st.error("The spatial raster could not be prepared.")
+    st.stop()
+
+try:
+    map_obj = map_for_geotiff(
+        tif_bytes, geometry_geojson(geom), bounds, params, spatial_title
     )
+    st_folium(map_obj, use_container_width=True, height=620, returned_objects=[])
+except Exception as exc:
+    st.error(f"Spatial map rendering failed: {exc}")
+    st.stop()
+
+st.download_button(
+    "Download GeoTIFF",
+    data=tif_bytes,
+    file_name=st.session_state.get("spatial_tif_name", "lake_index.tif"),
+    mime="image/tiff",
+)
 
 st.caption(
     "Interpretation: these products are Sentinel-2 spectral indices/proxies. "
