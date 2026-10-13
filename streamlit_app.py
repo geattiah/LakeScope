@@ -221,28 +221,39 @@ st.caption(f"Selected area: approximately {area_km2:,.2f} km²")
 if area_km2 > 10000:
     st.warning("This is a large analysis area. Sentinel-2 reductions and downloads may be slow.")
 
-# Configuration form
-with st.form("analysis_controls"):
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        group = st.selectbox(
-            "Water-quality property",
-            ["Chlorophyll / algal proxy", "DOC / CDOM proxy", "Turbidity proxy"],
-        )
-        index_key = st.selectbox(
-            "Spectral index",
-            keys_for_group(group),
-            format_func=lambda k: INDEX_DEFINITIONS[k]["label"],
-        )
-        spec = INDEX_DEFINITIONS[index_key]
-        st.caption(f"Formula: {spec['formula']}")
+# Reactive property/index controls.
+# These intentionally live OUTSIDE the form so changing the water-quality
+# property immediately refreshes the available indices and their description.
+group = st.selectbox(
+    "Water-quality property",
+    ["Chlorophyll / algal proxy", "DOC / CDOM proxy", "Turbidity proxy"],
+    key="water_quality_group",
+)
 
-    with c2:
+index_options = keys_for_group(group)
+index_key = st.selectbox(
+    "Spectral index",
+    index_options,
+    format_func=lambda k: INDEX_DEFINITIONS[k]["label"],
+    # A group-specific key makes Streamlit select the first valid index when
+    # the property changes (e.g., NDTI for Turbidity) instead of retaining a
+    # stale index from the previous property.
+    key=f"spectral_index_{group}",
+)
+spec = INDEX_DEFINITIONS[index_key]
+st.caption(f"Formula: {spec['formula']}")
+st.caption(spec["description"])
+
+# Computational controls remain in a form so expensive analysis only runs
+# when the user explicitly clicks the Run button.
+with st.form("analysis_controls"):
+    c1, c2 = st.columns(2)
+    with c1:
         start_date = st.date_input("Start date", value=date(2024, 6, 1), min_value=MIN_S2_DATE, max_value=date.today())
         end_date = st.date_input("End date", value=date.today(), min_value=MIN_S2_DATE, max_value=date.today())
         temporal_mode = st.selectbox("Temporal series", ["Every acquisition", "Monthly median"])
 
-    with c3:
+    with c2:
         scene_cloud = st.slider("Maximum scene cloud (%)", 0, 100, 80, 5)
         cloud_prob = st.slider("Maximum cloud probability (%)", 0, 100, 40, 5)
         water_occ = st.slider("Persistent-water occurrence threshold (%)", 0, 100, 50, 5)
@@ -357,9 +368,19 @@ else:
 spec = INDEX_DEFINITIONS[index_key]
 vcol1, vcol2 = st.columns(2)
 with vcol1:
-    vmin = st.number_input("Map minimum", value=float(spec["vis_min"]), format="%.4f")
+    vmin = st.number_input(
+        "Map minimum",
+        value=float(spec["vis_min"]),
+        format="%.4f",
+        key=f"map_min_{index_key}",
+    )
 with vcol2:
-    vmax = st.number_input("Map maximum", value=float(spec["vis_max"]), format="%.4f")
+    vmax = st.number_input(
+        "Map maximum",
+        value=float(spec["vis_max"]),
+        format="%.4f",
+        key=f"map_max_{index_key}",
+    )
 if vmin >= vmax:
     st.error("Map minimum must be less than map maximum.")
     st.stop()
