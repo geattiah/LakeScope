@@ -45,7 +45,7 @@ def preview_uploaded_geometry(geom_geojson, bounds, label):
     m = folium.Map(
         location=center,
         zoom_start=10,
-        tiles="CartoDB positron",
+        tiles="OpenStreetMap",
         control_scale=True,
         prefer_canvas=True,
     )
@@ -189,15 +189,18 @@ def map_for_geotiff(tif_bytes, geom_geojson, bounds, params, title):
     minx, miny, maxx, maxy = bounds
     rgba, raster_bounds = geotiff_to_rgba(tif_bytes, params)
 
-    m = folium.Map(tiles=None, control_scale=True, prefer_canvas=True)
-    m.get_root().header.add_child(
-        folium.Element("<style>.leaflet-container{background:white !important;}</style>")
+    m = folium.Map(
+        location=[(miny + maxy) / 2.0, (minx + maxx) / 2.0],
+        zoom_start=10,
+        tiles="OpenStreetMap",
+        control_scale=True,
+        prefer_canvas=True,
     )
     folium.raster_layers.ImageOverlay(
         image=rgba,
         bounds=raster_bounds,
         name=title,
-        opacity=1.0,
+        opacity=0.72,
         interactive=False,
         cross_origin=False,
         zindex=2,
