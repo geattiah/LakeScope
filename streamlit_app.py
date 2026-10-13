@@ -9,7 +9,6 @@ import ee
 import folium
 import pandas as pd
 import streamlit as st
-from branca.colormap import LinearColormap
 from streamlit_folium import st_folium
 
 from gee_core import (
@@ -32,6 +31,64 @@ st.set_page_config(page_title="LakeScope", layout="wide")
 GEE_PROJECT = "gg-wa-temp-2025"
 MIN_S2_DATE = date(2017, 3, 28)
 MAX_UPLOAD_FEATURES = 50
+
+
+def ui_text(value) -> str:
+    """Use plain hyphens in user-facing text."""
+    return str(value).replace("-", "-").replace("-", "-")
+
+
+def preview_uploaded_geometry(geom_geojson, bounds, label):
+    """Build a lightweight upload-preview map with no Earth Engine work."""
+    minx, miny, maxx, maxy = bounds
+    center = [(miny + maxy) / 2.0, (minx + maxx) / 2.0]
+    m = folium.Map(
+        location=center,
+        zoom_start=10,
+        tiles="CartoDB positron",
+        control_scale=True,
+        prefer_canvas=True,
+    )
+    folium.GeoJson(
+        geom_geojson,
+        name=ui_text(label),
+        style_function=lambda _: {
+            "color": "#111111",
+            "weight": 3,
+            "fillColor": "#4C78A8",
+            "fillOpacity": 0.18,
+        },
+    ).add_to(m)
+    m.fit_bounds([[miny, minx], [maxy, maxx]])
+    return m
+
+
+def add_clean_legend(m, params, title):
+    """Add a compact legend with labels separated from the color bar."""
+    palette = ["#" + str(c).lstrip("#") for c in params["palette"]]
+    gradient = ", ".join(palette)
+    vmin = float(params["min"])
+    vmax = float(params["max"])
+    safe_title = ui_text(title)
+    legend_html = f"""
+    <div style="
+        position: fixed;
+        bottom: 28px; right: 22px; z-index: 9999;
+        width: min(320px, calc(100vw - 44px));
+        background: rgba(255,255,255,0.96);
+        border: 1px solid #999; border-radius: 6px;
+        padding: 10px 12px 9px 12px;
+        box-shadow: 0 1px 5px rgba(0,0,0,0.25);
+        font-family: Arial, sans-serif; font-size: 12px; color: #111;
+    "">
+      <div style="font-weight:600; line-height:1.25; margin-bottom:7px; word-break:break-word;">{safe_title}</div>
+      <div style="height:14px; border:1px solid #777; background:linear-gradient(to right, {gradient});"></div>
+      <div style="display:flex; justify-content:space-between; margin-top:4px; line-height:1;">
+        <span>{vmin:g}</span><span>{vmax:g}</span>
+      </div>
+    </div>
+    """
+    m.get_root().html.add_child(folium.Element(legend_html))
 
 
 @st.cache_data(show_spinner=False)
@@ -151,11 +208,7 @@ def map_for_geotiff(tif_bytes, geom_geojson, bounds, params, title):
         name="Uploaded boundary",
         style_function=lambda _: {"color": "black", "weight": 2.5, "fillOpacity": 0},
     ).add_to(m)
-    cmap = LinearColormap(
-        colors=["#" + str(c).lstrip("#") for c in params["palette"]],
-        vmin=params["min"], vmax=params["max"], caption=title,
-    )
-    cmap.add_to(m)
+    add_clean_legend(m, params, title)
     m.fit_bounds([[miny, minx], [maxy, maxx]])
     folium.LayerControl(collapsed=True).add_to(m)
     return m
@@ -175,15 +228,9 @@ st.caption(
 with st.expander("What the indices represent", expanded=False):
     st.write(
         "These outputs are spectral indices/proxies, not calibrated concentrations. "
-        "NDCI and MCI are chlorophyll/algal proxies; the blue–green indices are CDOM/DOC proxies; "
-        "and NDTI/red–NIR are turbidity/suspended-material proxies."
+        "NDCI and MCI are chlorophyll/algal proxies; the blue-green indices are CDOM/DOC proxies; "
+        "and NDTI/red-NIR are turbidity/suspended-material proxies."
     )
-
-try:
-    initialize_ee(GEE_PROJECT, st.secrets)
-except Exception as exc:
-    st.error(str(exc))
-    st.stop()
 
 uploaded = st.file_uploader(
     "Upload lake polygons",
@@ -221,6 +268,17 @@ st.caption(f"Selected area: approximately {area_km2:,.2f} km²")
 if area_km2 > 10000:
     st.warning("This is a large analysis area. Sentinel-2 reductions and downloads may be slow.")
 
+st.subheader("Uploaded lake boundary")
+st.caption("Preview of the selected polygon before any Sentinel-2 processing.")
+preview_map = preview_uploaded_geometry(geometry_geojson(geom), geom.bounds, geom_label)
+st_folium(
+    preview_map,
+    use_container_width=True,
+    height=430,
+    returned_objects=[],
+    key=f"upload_preview_{hashlib.sha256(payload).hexdigest()[:12]}_{selection}",
+)
+
 # Reactive property/index controls.
 # These intentionally live OUTSIDE the form so changing the water-quality
 # property immediately refreshes the available indices and their description.
@@ -234,7 +292,7 @@ index_options = keys_for_group(group)
 index_key = st.selectbox(
     "Spectral index",
     index_options,
-    format_func=lambda k: INDEX_DEFINITIONS[k]["label"],
+    format_func=lambda k: ui_text(INDEX_DEFINITIONS[k]["label"]),
     # A group-specific key makes Streamlit select the first valid index when
     # the property changes (e.g., NDTI for Turbidity) instead of retaining a
     # stale index from the previous property.
@@ -242,7 +300,7 @@ index_key = st.selectbox(
 )
 spec = INDEX_DEFINITIONS[index_key]
 st.caption(f"Formula: {spec['formula']}")
-st.caption(spec["description"])
+st.caption(ui_text(spec["description"]))
 
 # Computational controls remain in a form so expensive analysis only runs
 # when the user explicitly clicks the Run button.
@@ -268,6 +326,12 @@ if start_date > end_date:
 analysis_key = current_analysis_key(payload, selection, index_key, start_date, end_date, scene_cloud, cloud_prob, water_occ, temporal_mode)
 
 if run:
+    try:
+        initialize_ee(GEE_PROJECT, st.secrets)
+    except Exception as exc:
+        st.error(f"Earth Engine initialization failed: {exc}")
+        st.stop()
+
     ee_geom = shapely_to_ee(geom)
     with st.spinner("Searching Sentinel-2 and calculating the temporal series..."):
         collection = build_collection(
@@ -346,6 +410,12 @@ st.subheader("Spatial index")
 spatial_mode = st.radio("Spatial product", ["Single acquisition", "Period median", "Period P90", "Period mean"], horizontal=True)
 
 # Rebuild lazy EE objects from stored settings.
+try:
+    initialize_ee(GEE_PROJECT, st.secrets)
+except Exception as exc:
+    st.error(f"Earth Engine initialization failed: {exc}")
+    st.stop()
+
 ee_geom = shapely_to_ee(geom)
 collection = build_collection(
     ee_geom,
@@ -359,11 +429,11 @@ if spatial_mode == "Single acquisition":
     date_options = usable["date"].dt.strftime("%Y-%m-%d").tolist()
     selected_date = st.selectbox("Usable acquisition date", date_options, index=len(date_options)-1)
     spatial_image = daily_index_image(collection, selected_date, index_key, water_occ, ee_geom)
-    spatial_title = f"{INDEX_DEFINITIONS[index_key]['label']} — {selected_date}"
+    spatial_title = f"{ui_text(INDEX_DEFINITIONS[index_key]['label'])} - {selected_date}"
 else:
     reducer = spatial_mode.replace("Period ", "")
     spatial_image = period_index_image(collection, index_key, water_occ, ee_geom, reducer)
-    spatial_title = f"{INDEX_DEFINITIONS[index_key]['label']} — {spatial_mode}"
+    spatial_title = f"{ui_text(INDEX_DEFINITIONS[index_key]['label'])} - {spatial_mode}"
 
 spec = INDEX_DEFINITIONS[index_key]
 vcol1, vcol2 = st.columns(2)
