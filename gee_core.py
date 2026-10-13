@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from datetime import date
 from typing import Dict, List, Optional
+from collections.abc import Mapping
 
 import ee
 import pandas as pd
@@ -17,20 +18,42 @@ JRC_WATER = "JRC/GSW1_4/GlobalSurfaceWater"
 
 
 def initialize_ee(project: str, secrets=None) -> None:
-    """Initialize EE locally or with Streamlit service-account secrets."""
+    """Initialize Earth Engine locally or from Streamlit service-account secrets.
+
+    The hosted app accepts either a JSON string or a TOML table/dictionary for
+    the service-account key.  This prevents the common "could not be converted
+    to bytes" error when Streamlit parses a nested secret as a mapping.
+    """
     secrets = secrets or {}
 
     service_account = None
-    private_key = None
+    key_data = None
     try:
         earth = secrets.get("earth_engine", {})
         service_account = earth.get("service_account")
-        private_key = earth.get("private_key")
+        key_data = (
+            earth.get("private_key")
+            or earth.get("key_data")
+            or earth.get("credentials")
+        )
     except Exception:
         pass
 
-    if service_account and private_key:
-        credentials = ee.ServiceAccountCredentials(service_account, key_data=private_key)
+    if isinstance(key_data, Mapping):
+        key_data = json.dumps(dict(key_data))
+
+    if key_data and not service_account:
+        try:
+            parsed = json.loads(key_data)
+            service_account = parsed.get("client_email")
+        except Exception:
+            pass
+
+    if service_account and key_data:
+        credentials = ee.ServiceAccountCredentials(
+            service_account,
+            key_data=key_data,
+        )
         ee.Initialize(credentials, project=project)
         return
 
@@ -153,7 +176,23 @@ def daily_index_image(collection, date_string: str, index_key: str, water_occurr
 
 
 def period_index_image(collection, index_key: str, water_occurrence_threshold: int, aoi, reducer: str):
-    indexed = collection.map(lambda img: calculate_index(ee.Image(img), index_key, water_occurrence_threshold))
+    """Build a period composite from daily mosaics without EE custom-function mapping."""
+    dates = acquisition_dates(collection)
+    if not dates:
+        raise ValueError("No Sentinel-2 acquisition dates are available for this period.")
+
+    images = [
+        daily_index_image(
+            collection,
+            d,
+            index_key,
+            water_occurrence_threshold,
+            aoi,
+        )
+        for d in dates
+    ]
+    indexed = ee.ImageCollection.fromImages(images)
+
     if reducer == "Median":
         out = indexed.median()
     elif reducer == "P90":
@@ -181,42 +220,70 @@ def temporal_stats_acquisitions(
     water_occurrence_threshold: int,
     scale: int,
 ) -> pd.DataFrame:
-    dates = ee.List(collection.aggregate_array("date_str")).distinct().sort()
+    """Return one spatial-statistics record per unique Sentinel-2 acquisition date.
+
+    This deliberately avoids ``ee.List.map(PythonFunction)``.  That pattern can
+    fail during Earth Engine custom-function serialization in hosted Streamlit
+    environments.  We first resolve the relatively small list of acquisition
+    dates, then build the server-side Feature objects explicitly.
+    """
+    dates = acquisition_dates(collection)
+    if not dates:
+        return _clean_stats_df([])
+
     water = persistent_water_mask(water_occurrence_threshold)
     total_area_dict = ee.Image.pixelArea().updateMask(water).reduceRegion(
-        reducer=ee.Reducer.sum(), geometry=aoi, scale=scale,
-        maxPixels=1e10, bestEffort=True, tileScale=4,
+        reducer=ee.Reducer.sum(),
+        geometry=aoi,
+        scale=scale,
+        maxPixels=1e10,
+        bestEffort=True,
+        tileScale=4,
     )
-    total_area = ee.Number(ee.Algorithms.If(
-        total_area_dict.contains("area"), total_area_dict.get("area"), 0
-    ))
+    total_area = ee.Number(ee.Dictionary(total_area_dict).get("area", 0))
 
-    def one(ds):
-        ds = ee.String(ds)
-        start = ee.Date(ds)
+    features = []
+    for date_string in dates:
+        start = ee.Date(date_string)
         day = collection.filterDate(start, start.advance(1, "day"))
         mosaic = day.sort("CLOUDY_PIXEL_PERCENTAGE", False).mosaic().clip(aoi)
-        idx = calculate_index(mosaic, index_key, water_occurrence_threshold).clip(aoi)
-        stats = idx.reduceRegion(
-            reducer=_stat_reducer(), geometry=aoi, scale=scale,
-            maxPixels=1e10, bestEffort=True, tileScale=4,
-        )
-        valid_area_dict = ee.Image.pixelArea().updateMask(idx.mask()).reduceRegion(
-            reducer=ee.Reducer.sum(), geometry=aoi, scale=scale,
-            maxPixels=1e10, bestEffort=True, tileScale=4,
-        )
-        valid_area = ee.Number(ee.Algorithms.If(
-            valid_area_dict.contains("area"), valid_area_dict.get("area"), 0
-        ))
-        valid_fraction = ee.Algorithms.If(total_area.gt(0), valid_area.divide(total_area), 0)
-        props = ee.Dictionary(stats).combine({
-            "date": ds,
-            "source_scenes": day.size(),
-            "valid_fraction": valid_fraction,
-        })
-        return ee.Feature(None, props)
+        idx = calculate_index(
+            mosaic, index_key, water_occurrence_threshold
+        ).clip(aoi)
 
-    fc = ee.FeatureCollection(dates.map(one))
+        stats = idx.reduceRegion(
+            reducer=_stat_reducer(),
+            geometry=aoi,
+            scale=scale,
+            maxPixels=1e10,
+            bestEffort=True,
+            tileScale=4,
+        )
+
+        valid_area_dict = ee.Image.pixelArea().updateMask(idx.mask()).reduceRegion(
+            reducer=ee.Reducer.sum(),
+            geometry=aoi,
+            scale=scale,
+            maxPixels=1e10,
+            bestEffort=True,
+            tileScale=4,
+        )
+        valid_area = ee.Number(ee.Dictionary(valid_area_dict).get("area", 0))
+        valid_fraction = ee.Number(
+            ee.Algorithms.If(total_area.gt(0), valid_area.divide(total_area), 0)
+        )
+
+        props = ee.Dictionary(stats).combine(
+            ee.Dictionary({
+                "date": date_string,
+                "source_scenes": day.size(),
+                "valid_fraction": valid_fraction,
+            }),
+            overwrite=True,
+        )
+        features.append(ee.Feature(None, props))
+
+    fc = ee.FeatureCollection(features)
     info = fc.getInfo()
     rows = [f.get("properties", {}) for f in info.get("features", [])]
     return _clean_stats_df(rows)
@@ -231,45 +298,87 @@ def temporal_stats_monthly(
     water_occurrence_threshold: int,
     scale: int,
 ) -> pd.DataFrame:
-    start = ee.Date(str(start_date)).update(day=1)
-    end = ee.Date(str(end_date)).advance(1, "day")
-    n_months = end.difference(start, "month").ceil()
-    offsets = ee.List.sequence(0, n_months.subtract(1))
-    indexed = collection.map(lambda img: calculate_index(ee.Image(img), index_key, water_occurrence_threshold))
+    """Return monthly-median statistics from daily mosaics.
+
+    Daily index images are built explicitly in Python.  This avoids Earth
+    Engine custom-function serialization and also prevents multiple Sentinel-2
+    tiles from the same calendar date being treated as independent dates.
+    """
+    dates = acquisition_dates(collection)
+    if not dates:
+        return _clean_stats_df([])
+
+    by_month = {}
+    for d in dates:
+        month_key = d[:7]
+        by_month.setdefault(month_key, []).append(d)
+
     water = persistent_water_mask(water_occurrence_threshold)
     total_area_dict = ee.Image.pixelArea().updateMask(water).reduceRegion(
-        reducer=ee.Reducer.sum(), geometry=aoi, scale=scale,
-        maxPixels=1e10, bestEffort=True, tileScale=4,
+        reducer=ee.Reducer.sum(),
+        geometry=aoi,
+        scale=scale,
+        maxPixels=1e10,
+        bestEffort=True,
+        tileScale=4,
     )
-    total_area = ee.Number(ee.Algorithms.If(
-        total_area_dict.contains("area"), total_area_dict.get("area"), 0
-    ))
+    total_area = ee.Number(ee.Dictionary(total_area_dict).get("area", 0))
 
-    def one(offset):
-        ms = start.advance(ee.Number(offset), "month")
-        me = ms.advance(1, "month")
-        source = collection.filterDate(ms, me)
-        month_idx = indexed.filterDate(ms, me).median().rename("index").clip(aoi)
+    features = []
+    for month_key, month_dates in sorted(by_month.items()):
+        daily_images = [
+            daily_index_image(
+                collection,
+                d,
+                index_key,
+                water_occurrence_threshold,
+                aoi,
+            )
+            for d in month_dates
+        ]
+        month_idx = (
+            ee.ImageCollection.fromImages(daily_images)
+            .median()
+            .rename("index")
+            .clip(aoi)
+        )
+
         stats = month_idx.reduceRegion(
-            reducer=_stat_reducer(), geometry=aoi, scale=scale,
-            maxPixels=1e10, bestEffort=True, tileScale=4,
+            reducer=_stat_reducer(),
+            geometry=aoi,
+            scale=scale,
+            maxPixels=1e10,
+            bestEffort=True,
+            tileScale=4,
         )
-        valid_area_dict = ee.Image.pixelArea().updateMask(month_idx.mask()).reduceRegion(
-            reducer=ee.Reducer.sum(), geometry=aoi, scale=scale,
-            maxPixels=1e10, bestEffort=True, tileScale=4,
-        )
-        valid_area = ee.Number(ee.Algorithms.If(
-            valid_area_dict.contains("area"), valid_area_dict.get("area"), 0
-        ))
-        valid_fraction = ee.Algorithms.If(total_area.gt(0), valid_area.divide(total_area), 0)
-        props = ee.Dictionary(stats).combine({
-            "date": ms.format("YYYY-MM-01"),
-            "source_scenes": source.size(),
-            "valid_fraction": valid_fraction,
-        })
-        return ee.Feature(None, props)
 
-    fc = ee.FeatureCollection(offsets.map(one)).filter(ee.Filter.gt("source_scenes", 0))
+        valid_area_dict = ee.Image.pixelArea().updateMask(month_idx.mask()).reduceRegion(
+            reducer=ee.Reducer.sum(),
+            geometry=aoi,
+            scale=scale,
+            maxPixels=1e10,
+            bestEffort=True,
+            tileScale=4,
+        )
+        valid_area = ee.Number(ee.Dictionary(valid_area_dict).get("area", 0))
+        valid_fraction = ee.Number(
+            ee.Algorithms.If(total_area.gt(0), valid_area.divide(total_area), 0)
+        )
+
+        props = ee.Dictionary(stats).combine(
+            ee.Dictionary({
+                "date": f"{month_key}-01",
+                "source_scenes": collection.filterDate(
+                    ee.Date(f"{month_key}-01"),
+                    ee.Date(f"{month_key}-01").advance(1, "month"),
+                ).size(),
+                "valid_fraction": valid_fraction,
+            }),
+            overwrite=True,
+        )
+        features.append(ee.Feature(None, props))
+
+    fc = ee.FeatureCollection(features)
     info = fc.getInfo()
     rows = [f.get("properties", {}) for f in info.get("features", [])]
     return _clean_stats_df(rows)
