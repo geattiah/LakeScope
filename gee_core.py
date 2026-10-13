@@ -195,14 +195,16 @@ def period_index_image(collection, index_key: str, water_occurrence_threshold: i
     ]
     indexed = ee.ImageCollection.fromImages(images)
 
-    if reducer == "Median":
+    reducer_key = str(reducer).strip().lower()
+
+    if reducer_key == "median":
         out = indexed.median()
-    elif reducer == "P90":
+    elif reducer_key in {"p90", "90th percentile", "percentile 90"}:
         out = indexed.reduce(ee.Reducer.percentile([90])).rename("index")
-    elif reducer == "Mean":
+    elif reducer_key == "mean":
         out = indexed.mean()
     else:
-        raise ValueError(reducer)
+        raise ValueError(f"Unsupported period reducer: {reducer!r}")
     return ee.Image(out).rename("index").clip(aoi)
 
 
