@@ -92,10 +92,12 @@ def _mask_clouds_scale(image, cloud_probability_threshold: int):
         .divide(10000.0)
         .updateMask(clean)
     )
-    return optical.copyProperties(
-        image,
-        ["system:time_start", "system:index", "CLOUDY_PIXEL_PERCENTAGE"],
-    ).set("date_str", ee.Date(image.get("system:time_start")).format("YYYY-MM-dd"))
+    return ee.Image(
+        optical.copyProperties(
+            image,
+            ["system:time_start", "system:index", "CLOUDY_PIXEL_PERCENTAGE"],
+        ).set("date_str", ee.Date(image.get("system:time_start")).format("YYYY-MM-dd"))
+    )
 
 
 def build_collection(aoi, start_date, end_date, max_scene_cloud=80, cloud_probability_threshold=40):
@@ -156,7 +158,7 @@ def calculate_index(image, index_key: str, water_occurrence_threshold: int):
     else:
         raise ValueError(f"Unknown index: {index_key}")
 
-    return (
+    return ee.Image(
         idx.rename("index")
         .updateMask(persistent_water_mask(water_occurrence_threshold))
         .copyProperties(image, ["system:time_start", "date_str"])
